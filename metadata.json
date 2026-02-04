@@ -1,0 +1,5 @@
+{
+  "name": "Gen-Z Quiz Generator",
+  "description": "A modern, orange-themed AI-powered quiz generator for teachers and admins. Features Gemini 3 Flash integration, Turso DB readiness, and comprehensive curriculum support.",
+  "requestFramePermissions": []
+}
