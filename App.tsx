@@ -752,22 +752,19 @@ const Login = ({ onLogin }: { onLogin: (u: User) => void }) => {
            </div>
 
            <p className="text-center text-xs text-slate-400 mb-3 uppercase tracking-wider font-bold">Quick Login (Demo)</p>
-           <div className="grid grid-cols-2 gap-3">
-              <button 
-                type="button"
-                onClick={() => {setUsername('hairi'); setPassword('Midorima88@@')}}
-                className="p-3 border border-slate-200 dark:border-slate-700 rounded-xl text-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors text-left group"
-              >
-                <div className="flex items-center gap-2 mb-1"><ShieldCheck size={14} className="text-purple-500"/> <span className="font-bold text-slate-700 dark:text-slate-300">Admin</span></div>
-                <span className="text-slate-400 group-hover:text-purple-500 transition-colors">Click to fill</span>
-              </button>
+           <div className="grid grid-cols-1 gap-3">
               <button 
                 type="button"
                 onClick={() => {setUsername('guru123'); setPassword('guru123')}}
-                className="p-3 border border-slate-200 dark:border-slate-700 rounded-xl text-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors text-left group"
+                className="p-3 border border-slate-200 dark:border-slate-700 rounded-xl text-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors text-left group w-full"
               >
-                <div className="flex items-center gap-2 mb-1"><UserPlus size={14} className="text-brand-500"/> <span className="font-bold text-slate-700 dark:text-slate-300">Guru</span></div>
-                <span className="text-slate-400 group-hover:text-brand-500 transition-colors">Click to fill</span>
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                        <UserPlus size={14} className="text-brand-500"/> 
+                        <span className="font-bold text-slate-700 dark:text-slate-300">Guru (Demo)</span>
+                    </div>
+                    <span className="text-slate-400 group-hover:text-brand-500 transition-colors">Click to fill</span>
+                </div>
               </button>
            </div>
         </div>
