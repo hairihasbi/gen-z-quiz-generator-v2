@@ -245,6 +245,19 @@ export const generateQuizContent = async (
   const cognitiveRange = params.cognitiveLevels.join(', ');
   const typesList = params.types.join(', ');
 
+  // Mapping language code to full English name for prompt clarity
+  const langMap: Record<string, string> = {
+      'ID': 'Indonesian (Bahasa Indonesia)',
+      'EN': 'English',
+      'AR': 'Arabic (Bahasa Arab)',
+      'JP': 'Japanese',
+      'KR': 'Korean',
+      'CN': 'Mandarin Chinese (Traditional)',
+      'DE': 'German',
+      'FR': 'French'
+  };
+  const targetLanguage = langMap[params.languageContext] || 'Indonesian';
+
   // DISTRIBUTION LOGIC: 
   // If multiple types are selected, strictly instruct the AI to mix them.
   let distributionInstruction = "";
@@ -283,23 +296,25 @@ export const generateQuizContent = async (
     ${distributionInstruction}
 
     Rules:
-    1. For 'ESSAY' and 'SHORT_ANSWER', 'options' must be an empty array.
-    2. For 'COMPLEX_MULTIPLE_CHOICE', 'correctAnswer' should be a string containing all correct keys (e.g., "A, C").
-    3. For 'MULTIPLE_CHOICE', provide exactly ${params.mcOptionCount} options.
-    4. Generate a 'Blueprint' (Kisi-kisi) for every question mapping it to a Basic Competency (KD/CP) and Indicator.
-    5. FORMATTING: Ensure all text is formatted for direct rendering. Do not use markdown headers (#) or bolding (**) in the question text unless necessary. STRICTLY NO newlines inside the question stem unless it is a distinct paragraph. All math must be inline.
-    6. Output JSON ONLY.
+    1. OUTPUT LANGUAGE: The entire quiz (questions, options, explanations) MUST be generated in ${targetLanguage}. 
+       Exception: Specific terminology or quotes required by the subject (e.g., Quran verses in Arabic, English terms in IT) should remain in their original form, but the surrounding question text must be in ${targetLanguage}.
+    2. For 'ESSAY' and 'SHORT_ANSWER', 'options' must be an empty array.
+    3. For 'COMPLEX_MULTIPLE_CHOICE', 'correctAnswer' should be a string containing all correct keys (e.g., "A, C").
+    4. For 'MULTIPLE_CHOICE', provide exactly ${params.mcOptionCount} options.
+    5. Generate a 'Blueprint' (Kisi-kisi) for every question mapping it to a Basic Competency (KD/CP) and Indicator.
+    6. FORMATTING: Ensure all text is formatted for direct rendering. Do not use markdown headers (#) or bolding (**) in the question text unless necessary. STRICTLY NO newlines inside the question stem unless it is a distinct paragraph. All math must be inline.
+    7. Output JSON ONLY.
   `;
 
   // --- IMPROVED READING MODE LOGIC ---
   if (params.readingMode === 'grouped') {
-    systemInstruction += `\n7. STIMULUS (GROUPED MODE - CRITICAL):
+    systemInstruction += `\n8. STIMULUS (GROUPED MODE - CRITICAL):
     - Generate ONE SINGLE, COMPREHENSIVE reading passage (wacana) containing 3-5 paragraphs (approx. 300-500 words).
     - The passage must be complex enough to support all ${params.questionCount} questions.
     - All questions must be derived from this SINGLE shared passage.
     - IMPORTANT: Copy the EXACT SAME passage text into the 'stimulus' field for EVERY question object in the JSON array. Do not generate short snippets.`;
   } else if (params.readingMode === 'simple' || params.enableReadingPassages) {
-    systemInstruction += `\n7. STIMULUS (SIMPLE MODE):
+    systemInstruction += `\n8. STIMULUS (SIMPLE MODE):
     - Provide a unique, short 'stimulus' string (1 paragraph, dialogue, or case) specifically for EACH question.`;
   }
 
