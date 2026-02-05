@@ -245,6 +245,20 @@ export const generateQuizContent = async (
   const cognitiveRange = params.cognitiveLevels.join(', ');
   const typesList = params.types.join(', ');
 
+  // DISTRIBUTION LOGIC: 
+  // If multiple types are selected, strictly instruct the AI to mix them.
+  let distributionInstruction = "";
+  if (params.types.length > 1) {
+      distributionInstruction = `
+      CRITICAL DISTRIBUTION RULE:
+      The user has selected multiple question types: [${typesList}].
+      You MUST distribute the ${params.questionCount} questions approximately evenly among these selected types.
+      
+      Example: If 10 questions are requested and types are [MULTIPLE_CHOICE, ESSAY], you MUST generate 5 Multiple Choice and 5 Essay questions.
+      Group questions of the same type together (e.g., all Multiple Choice first, then all Essays).
+      `;
+  }
+
   let systemInstruction = `
     You are an expert curriculum developer for the Indonesian 'Kurikulum Merdeka'.
     Your task is to generate a high-quality exam quiz based on the provided parameters.
@@ -265,6 +279,8 @@ export const generateQuizContent = async (
     - Question Types allowed: ${typesList}
     - Multiple Choice Options: ${params.mcOptionCount} (only for MC type)
     - Image Requirements: Approximately ${params.imageQuestionCount} questions must require a visual aid. For these, provide a highly descriptive 'imagePrompt'.
+
+    ${distributionInstruction}
 
     Rules:
     1. For 'ESSAY' and 'SHORT_ANSWER', 'options' must be an empty array.
