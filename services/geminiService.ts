@@ -555,11 +555,19 @@ export const generateQuizContent = async (
             // Robust JSON Cleaning & Parsing
             const cleanJson = (str: string) => {
                 let cleaned = str.replace(/```json\s*/g, "").replace(/```\s*/g, "");
+                
                 const firstOpen = cleaned.indexOf('{');
                 const lastClose = cleaned.lastIndexOf('}');
+                
                 if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
                     cleaned = cleaned.substring(firstOpen, lastClose + 1);
                 }
+                
+                // If it looks like a list of objects (e.g. "}, {") but missing the root array/object wrapper
+                if (/}\s*,\s*{/.test(cleaned) && !cleaned.trim().startsWith('[') && !cleaned.includes('"questions":')) {
+                     cleaned = `{ "questions": [${cleaned}], "blueprint": [] }`;
+                }
+                
                 return cleaned;
             };
 
@@ -572,7 +580,6 @@ export const generateQuizContent = async (
                 console.warn(`JSON Parse Failed (Attempt ${attempts + 1}). Trying to repair...`);
                 
                 // Attempt 1: Fix unescaped backslashes (common in LaTeX)
-                // This regex looks for backslashes that are NOT followed by specific JSON control chars or already escaped
                 try {
                     const fixedText = text.replace(/\\(?![/u"bfnrt\\])/g, '\\\\');
                     parsed = JSON.parse(fixedText);
@@ -590,17 +597,38 @@ export const generateQuizContent = async (
                 }
             }
             
-            let processedQuestions = parsed.questions.map((q: any, idx: number) => ({
-              ...q,
-              id: `gen-${Date.now()}-${idx}`,
-              text: sanitizeLatex(q.text),
-              explanation: sanitizeLatex(q.explanation),
-              options: q.options ? q.options.map((opt: string) => sanitizeLatex(opt)) : [],
-              stimulus: sanitizeLatex(q.stimulus),
-              hasImage: !!q.imagePrompt,
-              hasImageInOptions: false,
-              imageUrl: undefined 
-            }));
+            // Normalize Parsed Data (Handle Hallucinated Fields)
+            if (!parsed.questions && Array.isArray(parsed)) {
+                parsed = { questions: parsed, blueprint: [] };
+            }
+            
+            let processedQuestions = (parsed.questions || []).map((q: any, idx: number) => {
+                // Map hallucinated fields
+                const qText = q.text || q.question || q.questionStem || "";
+                
+                // Normalize options
+                let qOptions: string[] = [];
+                if (Array.isArray(q.options)) {
+                    if (q.options.length > 0 && typeof q.options[0] === 'object') {
+                        // Handle [{key: 'A', value: 'Option text'}] format
+                        qOptions = q.options.map((o: any) => o.value || o.text || JSON.stringify(o));
+                    } else {
+                        qOptions = q.options;
+                    }
+                }
+
+                return {
+                  ...q,
+                  id: `gen-${Date.now()}-${idx}`,
+                  text: sanitizeLatex(qText),
+                  explanation: sanitizeLatex(q.explanation),
+                  options: qOptions.map((opt: string) => sanitizeLatex(opt)),
+                  stimulus: sanitizeLatex(q.stimulus),
+                  hasImage: !!q.imagePrompt,
+                  hasImageInOptions: false,
+                  imageUrl: undefined 
+                };
+            });
 
             if (params.readingMode === 'grouped' && processedQuestions.length > 0) {
                 const masterStimulus = processedQuestions.find((q: any) => q.stimulus && q.stimulus.trim().length > 0)?.stimulus;
