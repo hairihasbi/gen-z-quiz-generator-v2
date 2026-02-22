@@ -153,8 +153,16 @@ const executeLiteLLM = async (
   endpoint: 'chat/completions' | 'images/generations',
   payload: any
 ): Promise<any> => {
-  const url = `${config.baseUrl.replace(/\/+$/, '')}/${endpoint}`;
+  // 1. Validate and Normalize URL
+  let baseUrl = config.baseUrl.trim().replace(/\/+$/, '');
+  if (!baseUrl.startsWith('http')) {
+      baseUrl = `https://${baseUrl}`; // Default to https if missing
+  }
   
+  const url = `${baseUrl}/${endpoint}`;
+  
+  console.log(`[LiteLLM] Calling: ${url} (Model: ${payload.model})`);
+
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -167,12 +175,18 @@ const executeLiteLLM = async (
 
     if (!response.ok) {
       const errText = await response.text();
-      throw new Error(`LiteLLM Error (${response.status}): ${errText}`);
+      console.error(`[LiteLLM] HTTP Error ${response.status}:`, errText);
+      throw new Error(`LiteLLM API Error (${response.status}): ${errText.substring(0, 200)}...`);
     }
 
     return await response.json();
-  } catch (error) {
-    console.error("LiteLLM Call Failed:", error);
+  } catch (error: any) {
+    console.error("[LiteLLM] Network/Fetch Failed:", error);
+    
+    // Enhance error message for common fetch failures
+    if (error.message === 'Failed to fetch' || error.name === 'TypeError') {
+        throw new Error(`Connection Failed to ${baseUrl}. Possible causes: CORS blocks, invalid URL, or server offline. Check browser console.`);
+    }
     throw error;
   }
 };
