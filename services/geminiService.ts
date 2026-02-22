@@ -465,8 +465,23 @@ export const generateQuizContent = async (
         throw new Error("AI returned empty response.");
     }
     
-    if (text.startsWith("```json")) text = text.replace(/^```json\s*/, "").replace(/\s*```$/, "");
-    else if (text.startsWith("```")) text = text.replace(/^```\s*/, "").replace(/\s*```$/, "");
+    // Robust JSON Cleaning
+    const cleanJson = (str: string) => {
+        // 1. Remove markdown code blocks
+        let cleaned = str.replace(/```json\s*/g, "").replace(/```\s*/g, "");
+        
+        // 2. Find the first '{' and the last '}' to extract the JSON object
+        const firstOpen = cleaned.indexOf('{');
+        const lastClose = cleaned.lastIndexOf('}');
+        
+        if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
+            cleaned = cleaned.substring(firstOpen, lastClose + 1);
+        }
+        
+        return cleaned;
+    };
+
+    text = cleanJson(text);
 
     let parsed;
     try {
