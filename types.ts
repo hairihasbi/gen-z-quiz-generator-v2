@@ -1,5 +1,3 @@
-
-
 export enum Role {
   ADMIN = 'ADMIN',
   TEACHER = 'TEACHER'
@@ -11,6 +9,7 @@ export interface User {
   role: Role;
   credits: number;
   isActive: boolean;
+  apiKeys?: string[]; // New: Optional custom API keys for the user
 }
 
 export enum QuestionType {
@@ -109,9 +108,20 @@ export interface AppSettings {
   siteName: string;
 }
 
+export interface AiProviderConfig {
+  provider: 'GEMINI' | 'LITELLM';
+  litellm: {
+    baseUrl: string;
+    apiKey: string;
+    textModel: string;
+    imageModel: string;
+  };
+}
+
 export interface SystemSettings {
   ai: {
     factCheck: boolean;
+    providerConfig?: AiProviderConfig;
   };
   cron: {
     enabled: boolean;
@@ -142,4 +152,15 @@ export interface QuizGenerationParams {
   languageContext: 'ID' | 'AR' | 'JP' | 'KR' | 'CN' | 'EN' | 'DE' | 'FR';
   enableReadingPassages?: boolean;
   readingMode?: 'none' | 'simple' | 'grouped';
+  
+  // User Keys
+  userApiKeys?: string[];
+}
+
+export interface PricingPackage {
+  name: string;
+  price: number;
+  credits: number; // Acts as quantity for Keys as well
+  color: string;
+  type: 'CREDIT' | 'API_KEY';
 }
