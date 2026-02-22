@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type, HarmCategory, HarmBlockThreshold } from "@google/genai";
-import { Question, QuestionType, QuizGenerationParams, Blueprint } from "../types";
+import { Question, QuestionType, QuizGenerationParams, Blueprint, AiProviderConfig } from "../types";
+import { dbService } from "./dbService";
 
 // --- API KEY STATS INTERFACE ---
 export interface KeyStats {
@@ -9,23 +10,25 @@ export interface KeyStats {
   lastUsed: number | null;
   status: 'ACTIVE' | 'RATE_LIMITED' | 'ERROR';
   lastErrorTime: number | null;
+  source: 'SYSTEM' | 'USER'; // Track where the key comes from
 }
 
 // In-memory store for stats (resets on page refresh)
 const keyUsageStore: Record<string, KeyStats> = {};
 
-// Helper to parse keys from env (comma separated)
-const getApiKeys = (): string[] => {
+// Helper to parse keys from env (comma separated) - System Keys
+const getSystemApiKeys = (): string[] => {
   const envKey = process.env.API_KEY;
   if (!envKey) return [];
-  // Support comma separated keys for rotation: "key1,key2,key3"
   return envKey.split(',').map(k => k.trim()).filter(k => k.length > 0);
 };
 
-// Initialize stats store if empty
-const initStats = () => {
-  const keys = getApiKeys();
-  keys.forEach(k => {
+// Initialize stats store if empty, including custom keys if passed
+const initStats = (customKeys: string[] = []) => {
+  const systemKeys = getSystemApiKeys();
+  const allKeys = [...new Set([...customKeys, ...systemKeys])]; // Deduplicate
+
+  allKeys.forEach(k => {
     if (!keyUsageStore[k]) {
       keyUsageStore[k] = {
         keyMask: `...${k.slice(-6)}`,
@@ -33,7 +36,8 @@ const initStats = () => {
         errorCount: 0,
         lastUsed: null,
         status: 'ACTIVE',
-        lastErrorTime: null
+        lastErrorTime: null,
+        source: systemKeys.includes(k) ? 'SYSTEM' : 'USER'
       };
     }
   });
@@ -45,128 +49,181 @@ export const getApiKeyStats = (): KeyStats[] => {
   return Object.values(keyUsageStore);
 };
 
-// Helper to execute AI calls with rotation mechanism
-// If a key hits 429 (Rate Limit) or 503 (Overloaded), it automatically tries the next one.
+// Helper to execute AI calls with Hybrid Rotation (User -> System)
 const executeWithRotation = async <T>(
-  operation: (ai: GoogleGenAI) => Promise<T>
+  operation: (ai: GoogleGenAI) => Promise<T>,
+  userKeys: string[] = [] // Optional user custom keys
 ): Promise<T> => {
-  const keys = getApiKeys();
-  if (keys.length === 0) {
-    throw new Error("API_KEY not found in environment variables");
-  }
+  
+  // 1. Determine the pool of keys to use
+  // Priority: User Keys -> System Keys
+  // We don't merge them initially. We try user keys first, then fallback to system.
+  const systemKeys = getSystemApiKeys();
+  const validUserKeys = userKeys.filter(k => k && k.length > 10); // Basic validation
+  
+  // Initialize stats for everything
+  initStats(validUserKeys);
 
-  // CRITICAL: Ensure stats are initialized before accessing
-  initStats();
+  // Strategy: Try all user keys first. If all fail/limit, try system keys.
+  const phases = [
+      { name: 'USER', keys: validUserKeys },
+      { name: 'SYSTEM', keys: systemKeys }
+  ];
 
   let lastError: any;
 
-  for (let i = 0; i < keys.length; i++) {
-    const apiKey = keys[i];
-    const stats = keyUsageStore[apiKey];
-    
-    // SKIP LOGIC: Skip key if it was rate limited recently (within last 60 seconds)
-    // UNLESS it's the last key available or we are in a desperate retry loop
-    if (stats && stats.status === 'RATE_LIMITED' && stats.lastErrorTime && (Date.now() - stats.lastErrorTime < 60000)) {
-        // If this is the last key in the list and we haven't found a success yet,
-        // we might as well try it instead of failing immediately, OR if we have only 1 key.
-        const isLastResort = i === keys.length - 1;
+  for (const phase of phases) {
+      if (phase.keys.length === 0) continue;
+
+      for (let i = 0; i < phase.keys.length; i++) {
+        const apiKey = phase.keys[i];
+        const stats = keyUsageStore[apiKey];
         
-        if (!isLastResort) {
-             console.warn(`Skipping limited key ${stats.keyMask} (Cooldown active)`);
-             continue; 
-        } else {
-             console.warn(`All keys limited. Forcing retry on last key: ${stats.keyMask}`);
-        }
-    }
-
-    try {
-      // Create a fresh client for this specific key
-      const ai = new GoogleGenAI({ apiKey });
-      
-      const result = await operation(ai);
-      
-      // Update Stats: Success
-      if (keyUsageStore[apiKey]) {
-          keyUsageStore[apiKey].usageCount++;
-          keyUsageStore[apiKey].lastUsed = Date.now();
-          keyUsageStore[apiKey].status = 'ACTIVE'; 
-          keyUsageStore[apiKey].errorCount = 0; // Optional: Reset consecutive errors on success
-      }
-
-      return result;
-
-    } catch (error: any) {
-      lastError = error;
-      
-      // Check if error is related to Rate Limit (429), Quota, or Server Overload (503)
-      const isRateLimit = 
-        error.status === 429 || 
-        error.status === 503 ||
-        error.message?.includes('429') || 
-        error.message?.includes('503') ||
-        error.message?.includes('quota') ||
-        error.message?.includes('overloaded') ||
-        error.message?.includes('Resource has been exhausted');
-
-      if (isRateLimit) {
-        // Update Stats: Rate Limited
-        if (keyUsageStore[apiKey]) {
-            keyUsageStore[apiKey].errorCount++;
-            keyUsageStore[apiKey].status = 'RATE_LIMITED';
-            keyUsageStore[apiKey].lastErrorTime = Date.now();
+        // SKIP LOGIC: Skip key if rate limited recently (within 60s)
+        if (stats && stats.status === 'RATE_LIMITED' && stats.lastErrorTime && (Date.now() - stats.lastErrorTime < 60000)) {
+            // If it's the very last key in the SYSTEM phase, force retry. Otherwise skip.
+            const isLastSystemKey = phase.name === 'SYSTEM' && i === phase.keys.length - 1;
+            
+            if (!isLastSystemKey) {
+                 console.warn(`Skipping limited key ${stats.keyMask} (${stats.source})`);
+                 continue; 
+            }
         }
 
-        console.warn(`Key ...${apiKey.slice(-4)} exhausted (Status: ${error.status || 'Limit'}). Rotating...`);
+        try {
+          const ai = new GoogleGenAI({ apiKey });
+          const result = await operation(ai);
+          
+          // Update Stats: Success
+          if (keyUsageStore[apiKey]) {
+              keyUsageStore[apiKey].usageCount++;
+              keyUsageStore[apiKey].lastUsed = Date.now();
+              keyUsageStore[apiKey].status = 'ACTIVE'; 
+              keyUsageStore[apiKey].errorCount = 0;
+          }
 
-        // If it's the last key, and we failed, throw the error
-        if (i === keys.length - 1) {
-          console.error(`All ${keys.length} API Keys exhausted.`);
-          throw new Error("Server sibuk atau limit tercapai pada semua API Key. Silakan coba sesaat lagi.");
+          return result;
+
+        } catch (error: any) {
+          lastError = error;
+          
+          const isRateLimit = 
+            error.status === 429 || 
+            error.status === 503 ||
+            error.message?.includes('429') || 
+            error.message?.includes('503') ||
+            error.message?.includes('quota') ||
+            error.message?.includes('overloaded') ||
+            error.message?.includes('Resource has been exhausted');
+
+          if (isRateLimit) {
+            // Update Stats
+            if (keyUsageStore[apiKey]) {
+                keyUsageStore[apiKey].errorCount++;
+                keyUsageStore[apiKey].status = 'RATE_LIMITED';
+                keyUsageStore[apiKey].lastErrorTime = Date.now();
+            }
+            console.warn(`Key ...${apiKey.slice(-4)} exhausted. Rotating...`);
+            
+            // Add slight delay
+            await new Promise(r => setTimeout(r, 500));
+            continue; // Go to next key in this phase
+          }
+          
+          // General Error
+          if (keyUsageStore[apiKey]) {
+              keyUsageStore[apiKey].errorCount++;
+              keyUsageStore[apiKey].status = 'ERROR';
+              keyUsageStore[apiKey].lastErrorTime = Date.now();
+          }
+          throw error; // Don't rotate on bad prompts
         }
-        
-        // Add a tiny delay before switching to prevent rapid-fire banning
-        await new Promise(r => setTimeout(r, 500));
-        continue;
       }
       
-      // Update Stats: General Error (Logic error, invalid prompt, etc)
-      if (keyUsageStore[apiKey]) {
-          keyUsageStore[apiKey].errorCount++;
-          keyUsageStore[apiKey].status = 'ERROR';
-          keyUsageStore[apiKey].lastErrorTime = Date.now();
-      }
-
-      // If it's not a connection/limit error, throw immediately (don't rotate for bad prompts)
-      throw error;
-    }
+      // If we finished a phase and didn't return, we loop to the next phase (User -> System)
+      console.log(`Phase ${phase.name} exhausted. Switching to next phase...`);
   }
 
-  throw lastError || new Error("Unknown error in API rotation");
+  throw lastError || new Error("Semua API Key (User & System) sedang sibuk atau habis kuota.");
+};
+
+// --- LITELLM / OPENAI COMPATIBLE HELPER ---
+const executeLiteLLM = async (
+  config: AiProviderConfig['litellm'],
+  endpoint: 'chat/completions' | 'images/generations',
+  payload: any
+): Promise<any> => {
+  const url = `${config.baseUrl.replace(/\/+$/, '')}/${endpoint}`;
+  
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.apiKey}`
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`LiteLLM Error (${response.status}): ${errText}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("LiteLLM Call Failed:", error);
+    throw error;
+  }
 };
 
 // --- SYSTEM HEALTH CHECK ---
 export const validateGeminiConnection = async (): Promise<{success: boolean, message: string, latency: number, keyCount: number}> => {
   const startTime = Date.now();
-  const keys = getApiKeys();
+  
+  // Check settings first to see which provider is active
+  const settings = await dbService.getSettings();
+  const providerConfig = settings.ai.providerConfig;
+
+  if (providerConfig?.provider === 'LITELLM') {
+      try {
+          await executeLiteLLM(providerConfig.litellm, 'chat/completions', {
+              model: providerConfig.litellm.textModel,
+              messages: [{ role: "user", content: "Ping" }],
+              max_tokens: 5
+          });
+          const duration = Date.now() - startTime;
+          return {
+              success: true,
+              message: `LiteLLM Active (${providerConfig.litellm.baseUrl})`,
+              latency: duration,
+              keyCount: 1
+          };
+      } catch (e: any) {
+          return { success: false, message: `LiteLLM Error: ${e.message}`, latency: 0, keyCount: 0 };
+      }
+  }
+
+  // Default Gemini Check
+  const keys = getSystemApiKeys(); // Admin check only checks system keys usually
   
   if (keys.length === 0) {
     return { success: false, message: "API_KEY not found in environment variables", latency: 0, keyCount: 0 };
   }
 
   try {
-    // Try to ping with the first key just to check connectivity
-    // We use executeWithRotation here too to ensure we use a valid key
+    // Ping with rotation using system keys only
     await executeWithRotation(async (ai) => {
         await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
             contents: { parts: [{ text: "Ping" }] },
         });
-    });
+    }, []);
 
     const duration = Date.now() - startTime;
     return { 
       success: true, 
-      message: `Active & Responding (Pool: ${keys.length} Keys)`, 
+      message: `System Keys Active (Pool: ${keys.length})`, 
       latency: duration, 
       keyCount: keys.length 
     };
@@ -176,7 +233,6 @@ export const validateGeminiConnection = async (): Promise<{success: boolean, mes
 };
 
 // --- PROMPT ENGINEERING HELPERS ---
-
 const getSubjectInstruction = (subject: string, category: string): string => {
   const base = `Subject: ${subject} (${category}).`;
   
@@ -207,29 +263,15 @@ const getSubjectInstruction = (subject: string, category: string): string => {
   return base;
 };
 
-// Helper to clean LaTeX and force inline
 const sanitizeLatex = (text: string): string => {
   if (!text) return "";
-  
   let clean = text;
-  
-  // 1. Replace Block delimiters $$...$$ with $...$
   clean = clean.replace(/\$\$([\s\S]*?)\$\$/g, '$$$1$$');
-  
-  // 2. Replace \[...\] with $...$
   clean = clean.replace(/\\\[([\s\S]*?)\\\]/g, '$$$1$$');
-  
-  // 3. Remove \displaystyle which forces large vertical spacing
   clean = clean.replace(/\\displaystyle/g, '');
-  
-  // 4. Remove equation environments
   clean = clean.replace(/\\begin\{equation\}/g, '$').replace(/\\end\{equation\}/g, '$');
   clean = clean.replace(/\\begin\{align\}/g, '$').replace(/\\end\{align\}/g, '$');
-  
-  // 5. Fix common newlines often added by AI around Math
-  // This regex finds newlines surrounding $...$ and removes them
   clean = clean.replace(/\n\s*(\$)/g, ' $1').replace(/(\$)\s*\n/g, '$1 ');
-
   return clean;
 };
 
@@ -237,15 +279,16 @@ export const generateQuizContent = async (
   params: QuizGenerationParams,
   factCheck: boolean = true
 ): Promise<{ questions: Question[], blueprint: Blueprint[] }> => {
-  const textModel = 'gemini-3-flash-preview';
-
-  // 1. Construct the System Instruction
-  const subjectSpecifics = getSubjectInstruction(params.subject, params.subjectCategory);
   
+  // CHECK PROVIDER CONFIG
+  const settings = await dbService.getSettings();
+  const providerConfig = settings.ai.providerConfig;
+  const useLiteLLM = providerConfig?.provider === 'LITELLM';
+
+  const subjectSpecifics = getSubjectInstruction(params.subject, params.subjectCategory);
   const cognitiveRange = params.cognitiveLevels.join(', ');
   const typesList = params.types.join(', ');
 
-  // Mapping language code to full English name for prompt clarity
   const langMap: Record<string, string> = {
       'ID': 'Indonesian (Bahasa Indonesia)',
       'EN': 'English',
@@ -258,17 +301,13 @@ export const generateQuizContent = async (
   };
   const targetLanguage = langMap[params.languageContext] || 'Indonesian';
 
-  // DISTRIBUTION LOGIC: 
-  // If multiple types are selected, strictly instruct the AI to mix them.
   let distributionInstruction = "";
   if (params.types.length > 1) {
       distributionInstruction = `
       CRITICAL DISTRIBUTION RULE:
       The user has selected multiple question types: [${typesList}].
       You MUST distribute the ${params.questionCount} questions approximately evenly among these selected types.
-      
-      Example: If 10 questions are requested and types are [MULTIPLE_CHOICE, ESSAY], you MUST generate 5 Multiple Choice and 5 Essay questions.
-      Group questions of the same type together (e.g., all Multiple Choice first, then all Essays).
+      Group questions of the same type together.
       `;
   }
 
@@ -297,32 +336,30 @@ export const generateQuizContent = async (
 
     Rules:
     1. OUTPUT LANGUAGE: The entire quiz (questions, options, explanations) MUST be generated in ${targetLanguage}. 
-       Exception: Specific terminology or quotes required by the subject (e.g., Quran verses in Arabic, English terms in IT) should remain in their original form, but the surrounding question text must be in ${targetLanguage}.
     2. For 'ESSAY' and 'SHORT_ANSWER', 'options' must be an empty array.
     3. For 'COMPLEX_MULTIPLE_CHOICE', 'correctAnswer' should be a string containing all correct keys (e.g., "A, C").
     4. For 'MULTIPLE_CHOICE', provide exactly ${params.mcOptionCount} options.
     5. Generate a 'Blueprint' (Kisi-kisi) for every question mapping it to a Basic Competency (KD/CP) and Indicator.
-    6. FORMATTING: Ensure all text is formatted for direct rendering. Do not use markdown headers (#) or bolding (**) in the question text unless necessary. STRICTLY NO newlines inside the question stem unless it is a distinct paragraph. All math must be inline.
+    6. FORMATTING: Ensure all text is formatted for direct rendering. Do not use markdown headers (#) or bolding (**) in the question text unless necessary. STRICTLY NO newlines inside the question stem. All math must be inline.
     7. Output JSON ONLY.
   `;
 
-  // --- IMPROVED READING MODE LOGIC ---
   if (params.readingMode === 'grouped') {
-    systemInstruction += `\n8. STIMULUS (GROUPED MODE - CRITICAL):
-    - Generate ONE SINGLE, COMPREHENSIVE reading passage (wacana) containing 3-5 paragraphs (approx. 300-500 words).
-    - The passage must be complex enough to support all ${params.questionCount} questions.
-    - All questions must be derived from this SINGLE shared passage.
-    - IMPORTANT: Copy the EXACT SAME passage text into the 'stimulus' field for EVERY question object in the JSON array. Do not generate short snippets.`;
+    systemInstruction += `\n8. STIMULUS (GROUPED MODE - STRICT):
+    - Create ONE single, long reading passage (wacana) of 300-500 words.
+    - Copy this EXACT same passage string into the 'stimulus' field of EVERY question.
+    - All questions must relate to this single passage.
+    - DO NOT vary the 'stimulus' string even by a single character between questions.`;
   } else if (params.readingMode === 'simple' || params.enableReadingPassages) {
     systemInstruction += `\n8. STIMULUS (SIMPLE MODE):
-    - Provide a unique, short 'stimulus' string (1 paragraph, dialogue, or case) specifically for EACH question.`;
+    - Provide a unique, short 'stimulus' string specifically for EACH question.`;
   }
 
   if (factCheck) {
-     systemInstruction += `\nSTRICT FACT CHECKING: Ensure all historical dates, scientific formulas, and factual statements are verified. If uncertain about a specific detail, verify logic step-by-step.`;
+     systemInstruction += `\nSTRICT FACT CHECKING: Ensure all historical dates, scientific formulas, and factual statements are verified.`;
   }
 
-  // 2. Define Schema
+  // Gemini Schema
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
@@ -331,15 +368,15 @@ export const generateQuizContent = async (
         items: {
           type: Type.OBJECT,
           properties: {
-            text: { type: Type.STRING, description: "The question stem. Use single '$' for inline LaTeX math. No line breaks." },
+            text: { type: Type.STRING },
             type: { type: Type.STRING, enum: Object.values(QuestionType) },
             options: { type: Type.ARRAY, items: { type: Type.STRING } },
             correctAnswer: { type: Type.STRING },
             explanation: { type: Type.STRING },
             difficulty: { type: Type.STRING },
             cognitiveLevel: { type: Type.STRING },
-            stimulus: { type: Type.STRING, nullable: true, description: "Reading passage or context." },
-            imagePrompt: { type: Type.STRING, nullable: true, description: "Prompt for Gemini Image gen if visual is needed." },
+            stimulus: { type: Type.STRING, nullable: true },
+            imagePrompt: { type: Type.STRING, nullable: true },
           },
           required: ['text', 'type', 'options', 'correctAnswer', 'explanation', 'difficulty', 'cognitiveLevel']
         }
@@ -361,81 +398,106 @@ export const generateQuizContent = async (
   };
 
   try {
-    // 3. Generate Text Content WITH ROTATION
-    const response = await executeWithRotation(async (ai) => {
-      return await ai.models.generateContent({
-        model: textModel,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: `Generate ${params.questionCount} questions about ${params.topic}.` },
-              // If reference image exists, add it to prompt context
-              ...(params.refImageBase64 ? [{
-                inlineData: {
-                  mimeType: "image/jpeg", // Assuming jpeg for simplicity, logic handles base64
-                  data: params.refImageBase64.split(',')[1] 
-                }
-              }, { text: "Use this image as a reference context for the questions." }] : [])
-            ]
-          }
-        ],
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: responseSchema,
-          temperature: 0.7,
-          // Add Safety Settings to prevent blocking harmless educational content
-          safetySettings: [
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          ]
-        }
-      });
-    });
+    let text = "";
 
-    let text = response.text;
-    
-    // Safety check for empty response
-    if (!text || text.trim().length === 0) {
-        // Fallback: Try to retrieve from candidates if text accessor failed but data exists
-        const candidate = response.candidates?.[0];
-        if (candidate?.finishReason !== 'STOP') {
-             throw new Error(`AI generation stopped unexpectedly. Reason: ${candidate?.finishReason || 'Unknown'}`);
+    if (useLiteLLM && providerConfig?.litellm) {
+        // --- LITELLM PATH ---
+        const messages = [
+            { role: "system", content: systemInstruction + "\n\nIMPORTANT: You must return valid JSON matching the described structure." },
+            { role: "user", content: `Generate ${params.questionCount} questions about ${params.topic}.` }
+        ];
+
+        if (params.refImageBase64) {
+             // OpenAI Vision format
+             messages[1].content = [
+                 { type: "text", text: `Generate ${params.questionCount} questions about ${params.topic}. Use this image as reference.` },
+                 { type: "image_url", image_url: { url: params.refImageBase64 } }
+             ] as any;
         }
-        throw new Error("AI returned empty response. Try reducing question count or changing topic.");
+
+        const result = await executeLiteLLM(providerConfig.litellm, 'chat/completions', {
+            model: providerConfig.litellm.textModel,
+            messages: messages,
+            response_format: { type: "json_object" }, // Try to force JSON mode
+            temperature: 0.7
+        });
+
+        text = result.choices?.[0]?.message?.content || "";
+
+    } else {
+        // --- GEMINI PATH ---
+        const textModel = 'gemini-3-flash-preview';
+        const response = await executeWithRotation(async (ai) => {
+          return await ai.models.generateContent({
+            model: textModel,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: `Generate ${params.questionCount} questions about ${params.topic}.` },
+                  ...(params.refImageBase64 ? [{
+                    inlineData: {
+                      mimeType: "image/jpeg",
+                      data: params.refImageBase64.split(',')[1] 
+                    }
+                  }, { text: "Use this image as a reference context for the questions." }] : [])
+                ]
+              }
+            ],
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema: responseSchema,
+              temperature: 0.7,
+              safetySettings: [
+                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              ]
+            }
+          });
+        }, params.userApiKeys); // Pass user keys here
+        text = response.text || "";
+    }
+
+    if (!text || text.trim().length === 0) {
+        throw new Error("AI returned empty response.");
     }
     
-    // Clean potential markdown wrapping if somehow the model adds it despite mimeType
-    text = text.trim();
-    if (text.startsWith("```json")) {
-        text = text.replace(/^```json\s*/, "").replace(/\s*```$/, "");
-    } else if (text.startsWith("```")) {
-        text = text.replace(/^```\s*/, "").replace(/\s*```$/, "");
-    }
+    if (text.startsWith("```json")) text = text.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+    else if (text.startsWith("```")) text = text.replace(/^```\s*/, "").replace(/\s*```$/, "");
 
     let parsed;
     try {
         parsed = JSON.parse(text);
     } catch (e) {
-        console.error("JSON Parse Error. Raw Text:", text);
-        throw new Error("Gagal memproses format data dari AI (Invalid JSON). Silakan coba lagi.");
+        console.error("JSON Parse Error. Raw text:", text);
+        throw new Error("Gagal memproses format data dari AI (Invalid JSON).");
     }
     
-    // 4. Post-process & Sanitize Math
-    const processedQuestions = parsed.questions.map((q: any, idx: number) => ({
+    let processedQuestions = parsed.questions.map((q: any, idx: number) => ({
       ...q,
       id: `gen-${Date.now()}-${idx}`,
-      text: sanitizeLatex(q.text), // Sanitize Text
-      explanation: sanitizeLatex(q.explanation), // Sanitize Explanation
-      options: q.options ? q.options.map((opt: string) => sanitizeLatex(opt)) : [], // Sanitize Options
-      stimulus: sanitizeLatex(q.stimulus), // Sanitize Stimulus
+      text: sanitizeLatex(q.text),
+      explanation: sanitizeLatex(q.explanation),
+      options: q.options ? q.options.map((opt: string) => sanitizeLatex(opt)) : [],
+      stimulus: sanitizeLatex(q.stimulus),
       hasImage: !!q.imagePrompt,
       hasImageInOptions: false,
       imageUrl: undefined 
     }));
+
+    // POST-PROCESSING FOR GROUPED MODE (CRITICAL FIX)
+    if (params.readingMode === 'grouped' && processedQuestions.length > 0) {
+        const masterStimulus = processedQuestions.find((q: any) => q.stimulus && q.stimulus.trim().length > 0)?.stimulus;
+        if (masterStimulus) {
+            processedQuestions = processedQuestions.map((q: any) => ({
+                ...q,
+                stimulus: masterStimulus 
+            }));
+        }
+    }
 
     return {
       questions: processedQuestions,
@@ -443,42 +505,67 @@ export const generateQuizContent = async (
     };
 
   } catch (error) {
-    console.error("Gemini Generation Error:", error);
+    console.error("Generation Error:", error);
     throw error;
   }
 };
 
-export const generateImageForQuestion = async (prompt: string): Promise<string> => {
-  const imageModel = 'gemini-2.5-flash-image';
+export const generateImageForQuestion = async (prompt: string, userKeys: string[] = []): Promise<string> => {
+  const settings = await dbService.getSettings();
+  const providerConfig = settings.ai.providerConfig;
+  const useLiteLLM = providerConfig?.provider === 'LITELLM';
 
   try {
-    // USE ROTATION FOR IMAGES TOO
-    const response = await executeWithRotation(async (ai) => {
-      return await ai.models.generateContent({
-        model: imageModel,
-        contents: prompt,
-      });
-    });
-
-    const parts = response.candidates?.[0]?.content?.parts;
-    if (parts) {
-      for (const part of parts) {
-        if (part.inlineData && part.inlineData.data) {
-           return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+    if (useLiteLLM && providerConfig?.litellm) {
+        // --- LITELLM IMAGE PATH ---
+        const result = await executeLiteLLM(providerConfig.litellm, 'images/generations', {
+            model: providerConfig.litellm.imageModel,
+            prompt: prompt,
+            n: 1,
+            size: "1024x1024",
+            response_format: "b64_json"
+        });
+        
+        const b64 = result.data?.[0]?.b64_json;
+        if (b64) {
+            return `data:image/png;base64,${b64}`;
+        } else if (result.data?.[0]?.url) {
+            // If URL returned, we might need to fetch it if it's not accessible directly or to convert to base64
+            // For now, return URL if it's a public URL, but base64 is safer for canvas/printing
+            return result.data[0].url;
         }
-      }
+
+    } else {
+        // --- GEMINI IMAGE PATH ---
+        const imageModel = 'gemini-2.5-flash-image';
+        const response = await executeWithRotation(async (ai) => {
+          return await ai.models.generateContent({
+            model: imageModel,
+            contents: prompt,
+          });
+        }, userKeys);
+
+        const parts = response.candidates?.[0]?.content?.parts;
+        if (parts) {
+          for (const part of parts) {
+            if (part.inlineData && part.inlineData.data) {
+               return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+            }
+          }
+        }
     }
+    
     return generateSvgFallback(prompt);
 
   } catch (error) {
-    console.warn("Image gen failed (rotation exhausted), using SVG fallback", error);
+    console.warn("Image gen failed, using SVG fallback", error);
     return generateSvgFallback(prompt);
   }
 };
 
 const generateSvgFallback = (prompt: string): string => {
-  const bg = "#fff7ed"; // brand-50
-  const stroke = "#f97316"; // brand-500
+  const bg = "#fff7ed";
+  const stroke = "#f97316";
   const text = prompt.length > 30 ? prompt.substring(0, 30) + "..." : prompt;
   
   const svg = `
