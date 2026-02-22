@@ -126,6 +126,7 @@ export interface SystemSettings {
   cron: {
     enabled: boolean;
   };
+  creditPackages?: PricingPackage[];
 }
 
 export interface QuizGenerationParams {
@@ -158,9 +159,10 @@ export interface QuizGenerationParams {
 }
 
 export interface PricingPackage {
+  id: string;
   name: string;
   price: number;
-  credits: number; // Acts as quantity for Keys as well
+  credits: number;
   color: string;
-  type: 'CREDIT' | 'API_KEY';
+  description?: string;
 }
