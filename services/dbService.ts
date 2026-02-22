@@ -1,3 +1,5 @@
+
+
 import { createClient, Client } from "@libsql/client/web";
 import { User, Quiz, Role, LogEntry, LogType, SystemSettings } from "../types";
 
@@ -171,9 +173,18 @@ class DbService {
             password TEXT,
             role TEXT,
             credits INTEGER,
-            is_active BOOLEAN
+            is_active BOOLEAN,
+            api_keys TEXT
         )
         `);
+
+        // Migration Check for existing tables without api_keys
+        try {
+            await this.client.execute("ALTER TABLE users ADD COLUMN api_keys TEXT");
+            console.log("Migrated: Added api_keys column to users");
+        } catch (e) {
+            // Column likely exists, ignore
+        }
 
         await this.client.execute(`
         CREATE TABLE IF NOT EXISTS quizzes (
@@ -250,8 +261,8 @@ class DbService {
     const existing = localStorage.getItem(LS_USERS);
     if (!existing) {
       const initialUsers = [
-        { id: '1', username: 'hairi', password: 'Midorima88@@', role: Role.ADMIN, credits: 9999, isActive: true },
-        { id: '2', username: 'guru123', password: 'guru123', role: Role.TEACHER, credits: 50, isActive: true }
+        { id: '1', username: 'hairi', password: 'Midorima88@@', role: Role.ADMIN, credits: 9999, isActive: true, apiKeys: [] },
+        { id: '2', username: 'guru123', password: 'guru123', role: Role.TEACHER, credits: 50, isActive: true, apiKeys: [] }
       ];
       localStorage.setItem(LS_USERS, JSON.stringify(initialUsers));
     }
@@ -276,7 +287,8 @@ class DbService {
             username: row.username as string,
             role: row.role as Role,
             credits: row.credits as number,
-            isActive: Boolean(row.is_active)
+            isActive: Boolean(row.is_active),
+            apiKeys: row.api_keys ? JSON.parse(row.api_keys as string) : []
           };
         }
         return null;
@@ -300,7 +312,8 @@ class DbService {
           username: row.username as string,
           role: row.role as Role,
           credits: row.credits as number,
-          isActive: Boolean(row.is_active)
+          isActive: Boolean(row.is_active),
+          apiKeys: row.api_keys ? JSON.parse(row.api_keys as string) : []
         }));
       } catch(e) { console.error(e); return []; }
     } else {
@@ -310,7 +323,8 @@ class DbService {
         username: u.username,
         role: u.role,
         credits: u.credits,
-        isActive: u.isActive
+        isActive: u.isActive,
+        apiKeys: u.apiKeys || []
       }));
     }
   }
@@ -318,8 +332,8 @@ class DbService {
   async createUser(user: User, password: string) {
     if (this.isTurso && this.client) {
       await this.client.execute({
-        sql: "INSERT INTO users (id, username, password, role, credits, is_active) VALUES (?, ?, ?, ?, ?, ?)",
-        args: [user.id, user.username, password, user.role, user.credits, user.isActive ? 1 : 0]
+        sql: "INSERT INTO users (id, username, password, role, credits, is_active, api_keys) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        args: [user.id, user.username, password, user.role, user.credits, user.isActive ? 1 : 0, JSON.stringify(user.apiKeys || [])]
       });
     } else {
       const users = JSON.parse(localStorage.getItem(LS_USERS) || '[]');
@@ -368,6 +382,22 @@ class DbService {
       const idx = users.findIndex((u: any) => u.id === userId);
       if (idx !== -1) {
         users[idx].credits = newCredits;
+        localStorage.setItem(LS_USERS, JSON.stringify(users));
+      }
+    }
+  }
+
+  async updateUserApiKeys(userId: string, keys: string[]) {
+    if (this.isTurso && this.client) {
+      await this.client.execute({
+        sql: "UPDATE users SET api_keys = ? WHERE id = ?",
+        args: [JSON.stringify(keys), userId]
+      });
+    } else {
+      const users = JSON.parse(localStorage.getItem(LS_USERS) || '[]');
+      const idx = users.findIndex((u: any) => u.id === userId);
+      if (idx !== -1) {
+        users[idx].apiKeys = keys;
         localStorage.setItem(LS_USERS, JSON.stringify(users));
       }
     }
@@ -491,15 +521,30 @@ class DbService {
   // --- Settings Operations ---
 
   async getSettings(): Promise<SystemSettings> {
-    const defaults: SystemSettings = { ai: { factCheck: true }, cron: { enabled: true } };
+    const defaults: SystemSettings = { 
+        ai: { factCheck: true }, 
+        cron: { enabled: true },
+        creditPackages: [
+            { id: 'pkg-1', name: 'Paket Starter', price: 50000, credits: 50, color: 'bg-blue-50 border-blue-100 text-blue-700', description: 'Untuk pemula' },
+            { id: 'pkg-2', name: 'Paket Pro', price: 100000, credits: 100, color: 'bg-gradient-to-br from-brand-50 to-orange-50 border-brand-200 text-brand-700', description: 'Paling populer' },
+            { id: 'pkg-3', name: 'Paket Sekolah', price: 750000, credits: 1000, color: 'bg-orange-50 border-orange-100 text-orange-700', description: 'Untuk institusi' }
+        ]
+    };
+
     if (this.isTurso && this.client) {
         try {
             const res = await this.client.execute("SELECT data FROM settings WHERE id = 'config'");
-            if(res.rows.length > 0) return { ...defaults, ...JSON.parse(res.rows[0].data as string) };
+            if(res.rows.length > 0) {
+                const stored = JSON.parse(res.rows[0].data as string);
+                return { ...defaults, ...stored };
+            }
         } catch(e) { console.error(e); }
     } else {
         const local = localStorage.getItem(LS_SETTINGS);
-        if(local) return { ...defaults, ...JSON.parse(local) };
+        if(local) {
+            const stored = JSON.parse(local);
+            return { ...defaults, ...stored };
+        }
     }
     return defaults;
   }
