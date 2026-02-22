@@ -398,126 +398,164 @@ export const generateQuizContent = async (
   };
 
   try {
-    let text = "";
+    // RETRY LOGIC FOR ROBUSTNESS
+    let attempts = 0;
+    const maxAttempts = 2;
+    let lastError: any;
 
-    if (useLiteLLM && providerConfig?.litellm) {
-        // --- LITELLM PATH ---
-        const messages = [
-            { role: "system", content: systemInstruction + "\n\nIMPORTANT: You must return valid JSON matching the described structure." },
-            { role: "user", content: `Generate ${params.questionCount} questions about ${params.topic}.` }
-        ];
+    while (attempts < maxAttempts) {
+        try {
+            let text = "";
 
-        if (params.refImageBase64) {
-             // OpenAI Vision format
-             messages[1].content = [
-                 { type: "text", text: `Generate ${params.questionCount} questions about ${params.topic}. Use this image as reference.` },
-                 { type: "image_url", image_url: { url: params.refImageBase64 } }
-             ] as any;
-        }
+            if (useLiteLLM && providerConfig?.litellm) {
+                // --- LITELLM PATH ---
+                const messages = [
+                    { role: "system", content: systemInstruction + "\n\nIMPORTANT: You must return valid JSON matching the described structure. Do not include any markdown formatting or conversational text." },
+                    { role: "user", content: `Generate ${params.questionCount} questions about ${params.topic}.` }
+                ];
 
-        const result = await executeLiteLLM(providerConfig.litellm, 'chat/completions', {
-            model: providerConfig.litellm.textModel,
-            messages: messages,
-            response_format: { type: "json_object" }, // Try to force JSON mode
-            temperature: 0.7
-        });
+                // If this is a retry, add the previous error context
+                if (attempts > 0 && lastError) {
+                     messages.push({ role: "user", content: "The previous response was invalid JSON. Please regenerate the JSON strictly following the schema." });
+                }
 
-        text = result.choices?.[0]?.message?.content || "";
+                if (params.refImageBase64 && attempts === 0) {
+                     // OpenAI Vision format (only on first attempt to save tokens/complexity)
+                     messages[1].content = [
+                         { type: "text", text: `Generate ${params.questionCount} questions about ${params.topic}. Use this image as reference.` },
+                         { type: "image_url", image_url: { url: params.refImageBase64 } }
+                     ] as any;
+                }
 
-    } else {
-        // --- GEMINI PATH ---
-        const textModel = 'gemini-3-flash-preview';
-        const response = await executeWithRotation(async (ai) => {
-          return await ai.models.generateContent({
-            model: textModel,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  { text: `Generate ${params.questionCount} questions about ${params.topic}.` },
-                  ...(params.refImageBase64 ? [{
-                    inlineData: {
-                      mimeType: "image/jpeg",
-                      data: params.refImageBase64.split(',')[1] 
+                // Remove response_format if it caused issues or just keep it? 
+                // Some providers fail with it. Let's try-catch the call with it, fallback without.
+                let result;
+                try {
+                    result = await executeLiteLLM(providerConfig.litellm, 'chat/completions', {
+                        model: providerConfig.litellm.textModel,
+                        messages: messages,
+                        response_format: { type: "json_object" }, 
+                        temperature: 0.7
+                    });
+                } catch (e: any) {
+                    // If 400 error (likely due to response_format not supported), try without
+                    if (e.message.includes('400') || e.message.includes('unsupported')) {
+                        console.warn("LiteLLM json_object mode failed, retrying without...");
+                        result = await executeLiteLLM(providerConfig.litellm, 'chat/completions', {
+                            model: providerConfig.litellm.textModel,
+                            messages: messages,
+                            temperature: 0.7
+                        });
+                    } else {
+                        throw e;
                     }
-                  }, { text: "Use this image as a reference context for the questions." }] : [])
-                ]
-              }
-            ],
-            config: {
-              systemInstruction,
-              responseMimeType: "application/json",
-              responseSchema: responseSchema,
-              temperature: 0.7,
-              safetySettings: [
-                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-              ]
+                }
+
+                text = result.choices?.[0]?.message?.content || "";
+
+            } else {
+                // --- GEMINI PATH ---
+                // Gemini doesn't need the retry loop as much because it has native schema enforcement, 
+                // but we keep it inside the loop for consistency if we ever want to retry Gemini too.
+                // For now, if Gemini fails, we just throw because executeWithRotation handles its own retries.
+                if (attempts > 0) throw lastError; // Don't retry Gemini here, it's expensive and usually unnecessary with schema
+
+                const textModel = 'gemini-3-flash-preview';
+                const response = await executeWithRotation(async (ai) => {
+                  return await ai.models.generateContent({
+                    model: textModel,
+                    contents: [
+                      {
+                        role: 'user',
+                        parts: [
+                          { text: `Generate ${params.questionCount} questions about ${params.topic}.` },
+                          ...(params.refImageBase64 ? [{
+                            inlineData: {
+                              mimeType: "image/jpeg",
+                              data: params.refImageBase64.split(',')[1] 
+                            }
+                          }, { text: "Use this image as a reference context for the questions." }] : [])
+                        ]
+                      }
+                    ],
+                    config: {
+                      systemInstruction,
+                      responseMimeType: "application/json",
+                      responseSchema: responseSchema,
+                      temperature: 0.7,
+                      safetySettings: [
+                        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                      ]
+                    }
+                  });
+                }, params.userApiKeys); 
+                text = response.text || "";
             }
-          });
-        }, params.userApiKeys); // Pass user keys here
-        text = response.text || "";
-    }
 
-    if (!text || text.trim().length === 0) {
-        throw new Error("AI returned empty response.");
-    }
-    
-    // Robust JSON Cleaning
-    const cleanJson = (str: string) => {
-        // 1. Remove markdown code blocks
-        let cleaned = str.replace(/```json\s*/g, "").replace(/```\s*/g, "");
-        
-        // 2. Find the first '{' and the last '}' to extract the JSON object
-        const firstOpen = cleaned.indexOf('{');
-        const lastClose = cleaned.lastIndexOf('}');
-        
-        if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
-            cleaned = cleaned.substring(firstOpen, lastClose + 1);
-        }
-        
-        return cleaned;
-    };
+            if (!text || text.trim().length === 0) {
+                throw new Error("AI returned empty response.");
+            }
+            
+            // Robust JSON Cleaning
+            const cleanJson = (str: string) => {
+                let cleaned = str.replace(/```json\s*/g, "").replace(/```\s*/g, "");
+                const firstOpen = cleaned.indexOf('{');
+                const lastClose = cleaned.lastIndexOf('}');
+                if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
+                    cleaned = cleaned.substring(firstOpen, lastClose + 1);
+                }
+                return cleaned;
+            };
 
-    text = cleanJson(text);
+            text = cleanJson(text);
 
-    let parsed;
-    try {
-        parsed = JSON.parse(text);
-    } catch (e) {
-        console.error("JSON Parse Error. Raw text:", text);
-        throw new Error("Gagal memproses format data dari AI (Invalid JSON).");
-    }
-    
-    let processedQuestions = parsed.questions.map((q: any, idx: number) => ({
-      ...q,
-      id: `gen-${Date.now()}-${idx}`,
-      text: sanitizeLatex(q.text),
-      explanation: sanitizeLatex(q.explanation),
-      options: q.options ? q.options.map((opt: string) => sanitizeLatex(opt)) : [],
-      stimulus: sanitizeLatex(q.stimulus),
-      hasImage: !!q.imagePrompt,
-      hasImageInOptions: false,
-      imageUrl: undefined 
-    }));
-
-    // POST-PROCESSING FOR GROUPED MODE (CRITICAL FIX)
-    if (params.readingMode === 'grouped' && processedQuestions.length > 0) {
-        const masterStimulus = processedQuestions.find((q: any) => q.stimulus && q.stimulus.trim().length > 0)?.stimulus;
-        if (masterStimulus) {
-            processedQuestions = processedQuestions.map((q: any) => ({
-                ...q,
-                stimulus: masterStimulus 
+            let parsed;
+            try {
+                parsed = JSON.parse(text);
+            } catch (e) {
+                console.error(`JSON Parse Error (Attempt ${attempts + 1}):`, text);
+                throw new Error("Invalid JSON");
+            }
+            
+            let processedQuestions = parsed.questions.map((q: any, idx: number) => ({
+              ...q,
+              id: `gen-${Date.now()}-${idx}`,
+              text: sanitizeLatex(q.text),
+              explanation: sanitizeLatex(q.explanation),
+              options: q.options ? q.options.map((opt: string) => sanitizeLatex(opt)) : [],
+              stimulus: sanitizeLatex(q.stimulus),
+              hasImage: !!q.imagePrompt,
+              hasImageInOptions: false,
+              imageUrl: undefined 
             }));
+
+            if (params.readingMode === 'grouped' && processedQuestions.length > 0) {
+                const masterStimulus = processedQuestions.find((q: any) => q.stimulus && q.stimulus.trim().length > 0)?.stimulus;
+                if (masterStimulus) {
+                    processedQuestions = processedQuestions.map((q: any) => ({
+                        ...q,
+                        stimulus: masterStimulus 
+                    }));
+                }
+            }
+
+            return {
+              questions: processedQuestions,
+              blueprint: parsed.blueprint || []
+            };
+
+        } catch (error) {
+            lastError = error;
+            attempts++;
+            console.warn(`Generation attempt ${attempts} failed:`, error);
+            if (attempts >= maxAttempts) throw error;
         }
     }
-
-    return {
-      questions: processedQuestions,
-      blueprint: parsed.blueprint || []
-    };
+    
+    throw lastError;
 
   } catch (error) {
     console.error("Generation Error:", error);
