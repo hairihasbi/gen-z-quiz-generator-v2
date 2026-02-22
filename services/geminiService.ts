@@ -359,6 +359,13 @@ export const generateQuizContent = async (
      systemInstruction += `\nSTRICT FACT CHECKING: Ensure all historical dates, scientific formulas, and factual statements are verified.`;
   }
 
+  systemInstruction += `\n9. JSON FORMATTING CRITICAL RULES:
+    - Output MUST be valid, parseable JSON.
+    - Enclose all keys and string values in DOUBLE QUOTES (").
+    - ESCAPE BACKSLASHES: You MUST double-escape all backslashes in LaTeX or strings (e.g. use "\\\\frac" instead of "\\frac", "\\\\alpha" instead of "\\alpha").
+    - No trailing commas.
+    - No unescaped newlines in strings.`;
+
   // Gemini Schema
   const responseSchema = {
     type: Type.OBJECT,
@@ -499,7 +506,7 @@ export const generateQuizContent = async (
                 throw new Error("AI returned empty response.");
             }
             
-            // Robust JSON Cleaning
+            // Robust JSON Cleaning & Parsing
             const cleanJson = (str: string) => {
                 let cleaned = str.replace(/```json\s*/g, "").replace(/```\s*/g, "");
                 const firstOpen = cleaned.indexOf('{');
@@ -516,8 +523,25 @@ export const generateQuizContent = async (
             try {
                 parsed = JSON.parse(text);
             } catch (e) {
-                console.error(`JSON Parse Error (Attempt ${attempts + 1}):`, text);
-                throw new Error("Invalid JSON");
+                console.warn(`JSON Parse Failed (Attempt ${attempts + 1}). Trying to repair...`);
+                
+                // Attempt 1: Fix unescaped backslashes (common in LaTeX)
+                // This regex looks for backslashes that are NOT followed by specific JSON control chars or already escaped
+                try {
+                    const fixedText = text.replace(/\\(?![/u"bfnrt\\])/g, '\\\\');
+                    parsed = JSON.parse(fixedText);
+                    console.log("JSON Repaired with backslash fix.");
+                } catch (e2) {
+                    // Attempt 2: Fix unescaped newlines in strings
+                    try {
+                         const fixedText2 = text.replace(/(?<!\\)\n/g, "\\n");
+                         parsed = JSON.parse(fixedText2);
+                         console.log("JSON Repaired with newline fix.");
+                    } catch (e3) {
+                        console.error(`JSON Repair Failed. Raw text:`, text);
+                        throw new Error("Invalid JSON structure received from AI.");
+                    }
+                }
             }
             
             let processedQuestions = parsed.questions.map((q: any, idx: number) => ({
