@@ -404,6 +404,35 @@ export const generateQuizContent = async (
     }
   };
 
+  // JSON Structure Definition for LiteLLM (since it doesn't use responseSchema)
+  const jsonStructureDefinition = `
+  REQUIRED JSON STRUCTURE:
+  {
+    "questions": [
+      {
+        "text": "Question text here",
+        "type": "One of: ${Object.values(QuestionType).join(', ')}",
+        "options": ["Option A", "Option B", ...],
+        "correctAnswer": "Correct answer string",
+        "explanation": "Explanation here",
+        "difficulty": "One of: EASY, MEDIUM, HARD",
+        "cognitiveLevel": "One of: C1, C2, C3, C4, C5, C6",
+        "stimulus": "Reading passage if applicable, else null",
+        "imagePrompt": "Image description if needed, else null"
+      }
+    ],
+    "blueprint": [
+      {
+        "questionNumber": 1,
+        "basicCompetency": "KD/CP description",
+        "indicator": "Indicator description",
+        "cognitiveLevel": "C-Level",
+        "difficulty": "Difficulty"
+      }
+    ]
+  }
+  `;
+
   try {
     // RETRY LOGIC FOR ROBUSTNESS
     let attempts = 0;
@@ -416,8 +445,11 @@ export const generateQuizContent = async (
 
             if (useLiteLLM && providerConfig?.litellm) {
                 // --- LITELLM PATH ---
+                // Append Schema Definition to System Prompt for LiteLLM
+                const liteLLMSystemInstruction = systemInstruction + "\n\n" + jsonStructureDefinition + "\n\nIMPORTANT: You must return valid JSON matching the described structure. Do not include any markdown formatting or conversational text.";
+                
                 const messages = [
-                    { role: "system", content: systemInstruction + "\n\nIMPORTANT: You must return valid JSON matching the described structure. Do not include any markdown formatting or conversational text." },
+                    { role: "system", content: liteLLMSystemInstruction },
                     { role: "user", content: `Generate ${params.questionCount} questions about ${params.topic}.` }
                 ];
 
